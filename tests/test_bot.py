@@ -101,7 +101,7 @@ async def test_newpdf_and_group_rejection(harness):
 async def test_document_download(harness):
     bot, store, runner, update = harness
 
-    async def download(custom_path):
+    async def download(custom_path, **kwargs):
         custom_path.write_bytes(b"abc")
 
     remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
@@ -141,7 +141,7 @@ async def test_photo_album_order(harness):
     bot, store, runner, update = harness
     for value in (b"first", b"second", b"third"):
 
-        async def download(custom_path, content=value):
+        async def download(custom_path, content=value, **kwargs):
             custom_path.write_bytes(content)
 
         remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
@@ -159,7 +159,7 @@ async def test_photo_album_order(harness):
 async def test_failed_download_removes_partial_file(harness):
     bot, store, runner, update = harness
 
-    async def download(custom_path):
+    async def download(custom_path, **kwargs):
         custom_path.write_bytes(b"partial")
         raise RuntimeError("download interrupted")
 
@@ -198,7 +198,7 @@ async def upload_pdf(harness, count=20):
     writer.write(content)
     payload = content.getvalue()
 
-    async def download(custom_path):
+    async def download(custom_path, **kwargs):
         custom_path.write_bytes(payload)
 
     async def capture(**kwargs):

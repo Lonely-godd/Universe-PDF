@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from .config import Settings
 from .conversion import ConversionError
+from .download import download_file
 from .pdf_tools import selection_groups
 from .sessions import SessionError, SessionStore
 from .worker import WorkerRunner
@@ -144,8 +145,7 @@ class Controller:
         try:
             session = self.store.get(self.key(update))
             path = self.store.allocate(session, name, incoming.file_size)
-            remote = await incoming.get_file()
-            await remote.download_to_drive(custom_path=path)
+            await download_file(incoming, path)
             self.store.accept(session, path)
             session.pdf_action = None
             if path.suffix == ".pdf":
