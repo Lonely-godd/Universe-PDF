@@ -81,3 +81,13 @@ def test_page_and_output_limits(tmp_path, picture, existing_pdf, font):
 def test_empty_queue_rejected(tmp_path, font):
     with pytest.raises(ConversionError, match="файл"):
         Converter(font_path=font).compile([], tmp_path / "out.pdf")
+
+
+@pytest.mark.parametrize("suffix", ["jpg", "png", "webp", "bmp", "tiff", "gif", "heic"])
+def test_supported_image_decoders(tmp_path, font, suffix):
+    source = tmp_path / f"picture.{suffix}"
+    image = Image.new("RGB", (32, 24), "green")
+    image.save(source)
+    output = tmp_path / "result.pdf"
+    Converter(font_path=font).compile([source], output)
+    assert len(PdfReader(output).pages) == 1
