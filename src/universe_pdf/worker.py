@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .conversion import ConversionError, Converter
+from .pdf_tools import PDFTools
 
 
 class WorkerRunner:
@@ -15,6 +16,16 @@ class WorkerRunner:
         self.slots = asyncio.Semaphore(settings.conversion_concurrency)
 
     async def __call__(self, files, output):
+        return await self.run(files, output)
+
+    async def inspect_pdf(self, source):
+        result = await self.run([source], source.parent / "inspection.json", operation="inspect")
+        return result["pages"]
+
+    async def edit_pdf(self, source, output, action, selection):
+        return await self.run([source], output, operation=action, selection=selection)
+
+    async def run(self, files, output, *, operation="compile", selection=""):
         async with self.slots:
             manifest = output.parent / "job.json"
             status = output.parent / "status.json"
@@ -24,6 +35,8 @@ class WorkerRunner:
                         "files": [str(path.resolve()) for path in files],
                         "output": str(output.resolve()),
                         "status": str(status.resolve()),
+                        "operation": operation,
+                        "selection": selection,
                         "options": {
                             "font_path": self.settings.font_path,
                             "office_binary": self.settings.office_binary,
@@ -66,6 +79,7 @@ class WorkerRunner:
                 result = json.loads(status.read_text(encoding="utf-8"))
                 if process.returncode != 0 or not result.get("ok"):
                     raise ConversionError(result.get("error", "Не удалось собрать PDF."))
+                return result
             finally:
                 if process is not None:
                     await self.stop_tree(process)
@@ -96,8 +110,20 @@ class WorkerRunner:
 def main():
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     try:
-        Converter(**job["options"]).compile([Path(p) for p in job["files"]], Path(job["output"]))
         result = {"ok": True}
+        operation = job.get("operation", "compile")
+        if operation == "compile":
+            Converter(**job["options"]).compile(
+                [Path(p) for p in job["files"]], Path(job["output"])
+            )
+        else:
+            pdf = PDFTools(
+                **{key: job["options"][key] for key in ("max_pages", "max_output_bytes")}
+            )
+            if operation == "inspect":
+                result["pages"] = pdf.inspect(job["files"][0])
+            else:
+                pdf.edit(job["files"][0], job["output"], operation, job["selection"])
     except ConversionError as error:
         result = {"ok": False, "error": str(error)}
     except Exception:

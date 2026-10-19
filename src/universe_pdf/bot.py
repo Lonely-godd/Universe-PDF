@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from .config import Settings
 from .conversion import ConversionError
+from .pdf_tools import selection_groups
 from .sessions import SessionError, SessionStore
 from .worker import WorkerRunner
 
@@ -19,9 +20,22 @@ COMMANDS = [
     BotCommand("compile", "Закончить добавление файлов и создать PDF"),
     BotCommand("cancel", "Отменить текущую операцию"),
     BotCommand("newpdf", "Начать новый PDF"),
+    BotCommand("pdf", "Извлечь, удалить страницы или разделить PDF"),
 ]
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Новый PDF", "Собрать PDF"], ["Отмена", "Помощь"]], resize_keyboard=True
+    [["Новый PDF", "Собрать PDF"], ["Действия с PDF"], ["Отмена", "Помощь"]], resize_keyboard=True
+)
+PDF_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Извлечь страницы", "Разделить на части"],
+        ["Удалить страницы", "Добавить в сборку"],
+        ["Отмена", "Помощь"],
+    ],
+    resize_keyboard=True,
+)
+PAGE_KEYBOARD = ReplyKeyboardMarkup(
+    [["Действия с PDF", "Отмена"], ["Помощь"]],
+    resize_keyboard=True,
 )
 
 
@@ -58,6 +72,10 @@ class Controller:
             "1. Пришлите фото или документы — можно вперемешку и альбомами.\n"
             "2. Дождитесь подтверждения добавления всех файлов.\n"
             "3. Нажмите «Собрать PDF» или /compile.\n\n"
+            "Для отдельного PDF выберите действие в меню: извлечь страницы, удалить "
+            "страницы или разделить на части. Вернуться к последнему PDF: /pdf.\n"
+            "Номера страниц считаются с 1. Пример выборки: 1, 3-5, 12. "
+            "Для разделения: по 5 или 1-5; 6-10. Части придут в ZIP.\n\n"
             "Порядок страниц соответствует порядку сообщений. Для лучшего качества "
             "отправляйте фотографии как файлы.\n\n"
             "Форматы: JPG, PNG, WEBP, BMP, TIFF, GIF, HEIC/HEIF, PDF; "
@@ -68,9 +86,10 @@ class Controller:
             f"до {self.settings.max_pages} страниц. PDF до "
             f"{self.settings.max_output_bytes // 1_000_000} МБ.\n\n"
             "/newpdf — начать новый PDF\n/compile — собрать PDF\n"
-            "/cancel — очистить очередь\n/help — инструкция\n\n"
+            "/cancel — очистить очередь\n/pdf — действия с последним PDF\n/help — инструкция\n\n"
             f"Неактивная очередь хранится {self.settings.ttl_seconds // 60} мин. "
-            "После отправки PDF, отмены или перезапуска бота исходники удаляются. "
+            "После отправки общей сборки, отмены или перезапуска бота исходники удаляются. "
+            "После операций со страницами исходный PDF остаётся для повторного использования. "
             "PDF с паролем не поддерживается. Интерактивные поля и аннотации PDF "
             "не переносятся; для их сохранения заранее экспортируйте плоский PDF.",
             reply_markup=KEYBOARD,
@@ -128,6 +147,10 @@ class Controller:
             remote = await incoming.get_file()
             await remote.download_to_drive(custom_path=path)
             self.store.accept(session, path)
+            session.pdf_action = None
+            if path.suffix == ".pdf":
+                session.pdf_target = path
+                session.pdf_page_count = 0
         except SessionError as error:
             await message.reply_text(str(error))
             return
@@ -136,6 +159,9 @@ class Controller:
                 path.unlink(missing_ok=True)
             LOGGER.warning("Ошибка загрузки: %s", type(error).__name__)
             await message.reply_text("Не удалось скачать файл. Попробуйте отправить его ещё раз.")
+            return
+        if path.suffix == ".pdf":
+            await self.pdf_menu(update, context)
             return
         await message.reply_text(
             f"Добавлено файлов: {len(session.files)}. "
@@ -164,6 +190,9 @@ class Controller:
             session.busy = False
             raise
         coroutine = self.build_and_send(update.effective_message, key, session)
+        self.launch(coroutine, update, context)
+
+    def launch(self, coroutine, update, context):
         task = (
             context.application.create_task(coroutine, update=update)
             if context
@@ -171,6 +200,162 @@ class Controller:
         )
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+
+    async def pdf_session(self, update):
+        if not await self.allowed(update):
+            return None
+        session = self.store.sessions.get(self.key(update))
+        if session is None or session.pdf_target is None:
+            await update.effective_message.reply_text(
+                "Пришлите PDF, чтобы работать с его страницами."
+            )
+            return None
+        if session.busy:
+            await update.effective_message.reply_text(
+                "Документ уже обрабатывается. Дождитесь результата или /cancel."
+            )
+            return None
+        session.touched = time.monotonic()
+        return session
+
+    async def pdf_menu(self, update, context):
+        session = await self.pdf_session(update)
+        if session is None:
+            return
+        session.pdf_action = None
+        await update.effective_message.reply_text(
+            "PDF находится в очереди общей сборки. Выберите действие с последним присланным PDF:\n"
+            "• Извлечь одну или несколько страниц.\n"
+            "• Разделить документ на части и получить ZIP.\n"
+            "• Удалить ненужные страницы из копии.\n"
+            "• Продолжить общую сборку.\n\n"
+            f"В очереди файлов: {len(session.files)}. Исходник при работе со страницами сохраняется.",
+            reply_markup=PDF_KEYBOARD,
+        )
+
+    async def choose_pdf(self, update, context, action):
+        session = await self.pdf_session(update)
+        if session is None:
+            return
+        session.pdf_action = None
+        if action == "merge":
+            await update.effective_message.reply_text(
+                "PDF уже добавлен в сборку. Пришлите ещё файлы или нажмите /compile.",
+                reply_markup=KEYBOARD,
+            )
+            return
+        session.busy = True
+        try:
+            await update.effective_message.reply_text("Проверяю PDF и число страниц…")
+        except Exception:
+            session.busy = False
+            raise
+        self.launch(
+            self.pdf_job(update.effective_message, self.key(update), session, action),
+            update,
+            context,
+        )
+
+    async def pdf_input(self, update, context, session):
+        if not await self.allowed(update):
+            return
+        if session.busy:
+            await update.effective_message.reply_text(
+                "Документ уже обрабатывается. Пожалуйста, подождите."
+            )
+            return
+        session.touched = time.monotonic()
+        selection = update.effective_message.text
+        try:
+            selection_groups(session.pdf_action, selection, session.pdf_page_count)
+        except ConversionError as error:
+            await update.effective_message.reply_text(
+                str(error) + "\nПопробуйте ещё раз или откройте /pdf."
+            )
+            return
+        session.busy = True
+        try:
+            await update.effective_message.reply_text("Обрабатываю выбранные страницы…")
+        except Exception:
+            session.busy = False
+            raise
+        self.launch(
+            self.pdf_job(
+                update.effective_message, self.key(update), session, session.pdf_action, selection
+            ),
+            update,
+            context,
+        )
+
+    async def pdf_job(self, message, key, session, action, selection=None):
+        filenames = {"extract": "pages.pdf", "remove": "remaining.pdf", "split": "parts.zip"}
+        output = session.directory / filenames[action]
+        try:
+            if selection is None:
+                count = await self.runner.inspect_pdf(session.pdf_target)
+                if session.cancelled:
+                    return
+                session.pdf_page_count = count
+                session.pdf_action = action
+                prompt = {
+                    "extract": "Какие страницы извлечь? Например: 1, 3-5. Порядок ввода сохраняется.",
+                    "remove": "Какие страницы удалить из копии? Например: 1, 3-5. Нельзя удалить все страницы.",
+                    "split": "Как разделить PDF? Напишите «по 5» для частей по пять страниц "
+                    "или задайте части через точку с запятой: 1-5; 6-10. "
+                    "Укажите все страницы ровно один раз. Результат придёт одним ZIP.",
+                }[action]
+                await message.reply_text(
+                    f"В PDF страниц: {count}. Номера от 1 до {count} — позиции страниц в файле, "
+                    f"а не напечатанные на листах номера.\n\n{prompt}",
+                    reply_markup=PAGE_KEYBOARD,
+                )
+            else:
+                await self.runner.edit_pdf(session.pdf_target, output, action, selection)
+                if session.cancelled:
+                    return
+                session.sending = True
+                captions = {
+                    "extract": "Выбранные страницы готовы.",
+                    "remove": "Копия без выбранных страниц готова.",
+                    "split": "Готово! Части PDF находятся в ZIP-архиве.",
+                }
+                with output.open("rb") as stream:
+                    await message.reply_document(
+                        document=stream,
+                        filename=output.name,
+                        caption=captions[action]
+                        + " Исходный PDF сохранён. Можно выбрать другое действие или /cancel.",
+                        read_timeout=120,
+                        write_timeout=120,
+                        reply_markup=PDF_KEYBOARD,
+                    )
+                session.pdf_action = None
+        except Exception as error:
+            LOGGER.warning("Ошибка операции с PDF: %s", type(error).__name__)
+            if not session.cancelled:
+                text = (
+                    str(error)
+                    if isinstance(error, ConversionError)
+                    else "Не удалось обработать или отправить PDF."
+                )
+                try:
+                    await message.reply_text(
+                        text + "\nИсходник сохранён. Повторите ввод или выберите действие: /pdf."
+                    )
+                except Exception:
+                    LOGGER.warning("Не удалось отправить уведомление об ошибке PDF.")
+        finally:
+            output.unlink(missing_ok=True)
+            session.busy = session.sending = False
+            session.touched = time.monotonic()
+            if session.cancelled:
+                self.store.reset(key)
+                try:
+                    await message.reply_text(
+                        "Очистка завершена. Можно присылать новые файлы.", reply_markup=KEYBOARD
+                    )
+                except Exception:
+                    LOGGER.warning("Не удалось отправить уведомление об очистке PDF.")
 
     async def build_and_send(self, message, key, session):
         output = session.directory / "document.pdf"
@@ -219,14 +404,33 @@ class Controller:
             await asyncio.gather(*list(self.tasks))
 
     async def text(self, update, context):
+        if not await self.allowed(update):
+            return
         actions = {
             "Новый PDF": self.newpdf,
             "Собрать PDF": self.compile,
             "Отмена": self.cancel,
             "Помощь": self.help,
+            "Действия с PDF": self.pdf_menu,
         }
-        action = actions.get(update.effective_message.text, self.help)
-        await action(update, context)
+        text = update.effective_message.text
+        if text in actions:
+            await actions[text](update, context)
+            return
+        pdf_actions = {
+            "Извлечь страницы": "extract",
+            "Удалить страницы": "remove",
+            "Разделить на части": "split",
+            "Добавить в сборку": "merge",
+        }
+        if text in pdf_actions:
+            await self.choose_pdf(update, context, pdf_actions[text])
+            return
+        session = self.store.sessions.get(self.key(update))
+        if session and session.pdf_action:
+            await self.pdf_input(update, context, session)
+        else:
+            await self.help(update, context)
 
 
 def make_application(settings, root):
@@ -250,7 +454,8 @@ def make_application(settings, root):
         await application.bot.set_my_commands(COMMANDS, language_code="ru")
         await application.bot.set_my_description(
             "Собираю фотографии, PDF, текст и офисные документы в один PDF. "
-            "Пришлите файлы и нажмите /compile. Инструкция: /help."
+            "Также извлекаю и удаляю страницы, разделяю PDF на части. "
+            "Пришлите файлы и выберите действие. Инструкция: /help."
         )
         await application.bot.set_my_short_description(
             "Фото и документы в один PDF. Всё на русском."
@@ -276,6 +481,7 @@ def make_application(settings, root):
         ("newpdf", controller.newpdf),
         ("compile", controller.compile),
         ("cancel", controller.cancel),
+        ("pdf", controller.pdf_menu),
     ):
         application.add_handler(CommandHandler(command, action))
     application.add_handler(

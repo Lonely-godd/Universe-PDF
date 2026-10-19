@@ -80,7 +80,7 @@ async def test_cancel_during_conversion_suppresses_delivery(harness):
 
     runner.side_effect = delayed
     await bot.compile(update, None)
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 5)
     await bot.cancel(update, None)
     release.set()
     await bot.wait_tasks()
@@ -180,3 +180,204 @@ async def test_cancel_during_send_reports_it_is_too_late(harness):
     await bot.cancel(update, None)
     assert not session.cancelled
     assert "отправляется" in update.effective_message.reply_text.call_args.args[0]
+
+
+async def upload_pdf(harness, count=20):
+    import io
+
+    from pypdf import PdfWriter
+
+    from universe_pdf.worker import WorkerRunner
+
+    bot, store, _, update = harness
+    bot.runner = WorkerRunner(bot.settings)
+    writer = PdfWriter()
+    for number in range(1, count + 1):
+        writer.add_blank_page(width=200 + number, height=400)
+    content = io.BytesIO()
+    writer.write(content)
+    payload = content.getvalue()
+
+    async def download(custom_path):
+        custom_path.write_bytes(payload)
+
+    async def capture(**kwargs):
+        update.sent_bytes = kwargs["document"].read()
+
+    update.effective_message.reply_document.side_effect = capture
+    remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
+    update.effective_message.document = SimpleNamespace(
+        file_name="twenty.pdf", file_size=len(payload), get_file=AsyncMock(return_value=remote)
+    )
+    await bot.receive(update, None)
+    return store.get((1, 1))
+
+
+async def choose(harness, text):
+    bot, _, _, update = harness
+    update.effective_message.text = text
+    await bot.text(update, None)
+    await bot.wait_tasks()
+
+
+async def test_pdf_menu_and_real_extraction_dialog(harness):
+    import io
+
+    from pypdf import PdfReader
+
+    bot, store, runner, update = harness
+    other = queued(store).files[0]
+    session = await upload_pdf(harness)
+    assert "Выберите действие" in update.effective_message.reply_text.call_args.args[0]
+    await choose(harness, "Извлечь страницы")
+    assert "20" in update.effective_message.reply_text.call_args.args[0]
+    await choose(harness, "20, 1, 3-5")
+    pages = PdfReader(io.BytesIO(update.sent_bytes)).pages
+    assert [int(page.mediabox.width) - 200 for page in pages] == [20, 1, 3, 4, 5]
+    assert session.pdf_target.exists()
+    assert other.exists()
+    assert len(session.files) == 2
+    assert session.pdf_action is None
+    assert not (session.directory / "pages.pdf").exists()
+
+
+async def test_invalid_input_then_remove(harness):
+    import io
+
+    from pypdf import PdfReader
+
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    await choose(harness, "Удалить страницы")
+    await choose(harness, "0")
+    assert "от 1 до 20" in update.effective_message.reply_text.call_args.args[0]
+    assert session.pdf_action == "remove"
+    update.effective_message.reply_document.assert_not_called()
+    await choose(harness, "2-19")
+    assert len(PdfReader(io.BytesIO(update.sent_bytes)).pages) == 2
+
+
+async def test_split_dialog_and_reopen_menu(harness):
+    import io
+    import zipfile
+
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    await choose(harness, "Разделить на части")
+    await choose(harness, "по 5")
+    with zipfile.ZipFile(io.BytesIO(update.sent_bytes)) as archive:
+        assert len(archive.namelist()) == 4
+    await bot.pdf_menu(update, None)
+    assert session.pdf_target.exists()
+    await choose(harness, "Добавить в сборку")
+    assert len(session.files) == 1  # Повторно не добавляем.
+
+
+async def test_pdf_delivery_failure_can_retry(harness):
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    capture = update.effective_message.reply_document.side_effect
+    await choose(harness, "Извлечь страницы")
+    update.effective_message.reply_document.side_effect = RuntimeError("network")
+    await choose(harness, "1")
+    assert session.pdf_action == "extract"
+    assert session.pdf_target.exists()
+    assert not session.busy
+    update.effective_message.reply_document.side_effect = capture
+    await choose(harness, "1")
+    assert session.pdf_action is None
+
+
+async def test_cancel_pdf_operation_suppresses_send(harness):
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    await choose(harness, "Извлечь страницы")
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed(source, output, action, selection):
+        started.set()
+        await release.wait()
+        output.write_bytes(b"pdf")
+
+    bot.runner.edit_pdf = delayed
+    update.effective_message.text = "1"
+    await bot.text(update, None)
+    await asyncio.wait_for(started.wait(), 5)
+
+    await bot.cancel(update, None)
+    release.set()
+    await bot.wait_tasks()
+    update.effective_message.reply_document.assert_not_called()
+    assert not session.directory.exists()
+
+
+async def test_latest_pdf_replaces_selection_and_cancel_cleans(harness):
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    await choose(harness, "Извлечь страницы")
+    first = session.pdf_target
+    await upload_pdf(harness, count=3)
+    assert session.pdf_target != first
+    assert session.pdf_action is None
+    await choose(harness, "Извлечь страницы")
+    assert session.pdf_page_count == 3
+    await bot.cancel(update, None)
+    await bot.pdf_menu(update, None)
+    assert "Пришлите PDF" in update.effective_message.reply_text.call_args.args[0]
+
+
+async def test_cancel_during_pdf_inspection(harness):
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def inspect(source):
+        started.set()
+        await release.wait()
+        return 20
+
+    bot.runner.inspect_pdf = inspect
+    update.effective_message.text = "Извлечь страницы"
+    await bot.text(update, None)
+    await asyncio.wait_for(started.wait(), 5)
+    await bot.cancel(update, None)
+    release.set()
+    await bot.wait_tasks()
+    assert not session.directory.exists()
+    assert not any(
+        "В PDF страниц" in call.args[0]
+        for call in update.effective_message.reply_text.call_args_list
+    )
+
+
+async def test_pdf_is_not_visible_to_another_user(harness):
+    bot, store, runner, update = harness
+    original = await upload_pdf(harness)
+    update.effective_user.id = 2
+    update.effective_chat.id = 2
+    await choose(harness, "Извлечь страницы")
+    assert "Пришлите PDF" in update.effective_message.reply_text.call_args.args[0]
+    assert original.pdf_target.exists()
+
+
+async def test_unknown_text_without_sender_is_ignored(harness):
+    bot, store, runner, update = harness
+    update.effective_user = None
+    update.effective_message.text = "1-3"
+    await bot.text(update, None)
+    update.effective_message.reply_text.assert_not_called()
+
+
+async def test_compile_after_pdf_tools_still_works(harness):
+    import io
+
+    from pypdf import PdfReader
+
+    bot, store, runner, update = harness
+    session = await upload_pdf(harness)
+    await choose(harness, "Извлечь страницы")
+    await choose(harness, "1-2")
+    await bot.compile(update, None)
+    await bot.wait_tasks()
+    assert len(PdfReader(io.BytesIO(update.sent_bytes)).pages) == 20
+    assert not session.directory.exists()

@@ -20,6 +20,9 @@ class Session:
     busy: bool = False
     cancelled: bool = False
     sending: bool = False
+    pdf_target: Path | None = None
+    pdf_action: str | None = None
+    pdf_page_count: int = 0
 
 
 class SessionStore:
