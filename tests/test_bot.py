@@ -20,10 +20,14 @@ def harness(tmp_path):
 
     runner.side_effect = build
     controller = Controller(settings, store, runner)
-    message = SimpleNamespace(reply_text=AsyncMock(), reply_document=AsyncMock(),
-                              document=None, photo=[], text="")
-    update = SimpleNamespace(effective_chat=SimpleNamespace(id=1, type="private"),
-                             effective_user=SimpleNamespace(id=1), effective_message=message)
+    message = SimpleNamespace(
+        reply_text=AsyncMock(), reply_document=AsyncMock(), document=None, photo=[], text=""
+    )
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=1, type="private"),
+        effective_user=SimpleNamespace(id=1),
+        effective_message=message,
+    )
     return controller, store, runner, update
 
 
@@ -106,3 +110,73 @@ async def test_document_download(harness):
     )
     await bot.receive(update, None)
     assert len(store.get((1, 1)).files) == 1
+
+
+async def test_conversion_failure_preserves_queue(harness):
+    from universe_pdf.conversion import ConversionError
+
+    bot, store, runner, update = harness
+    session = queued(store)
+    runner.side_effect = ConversionError("Файл №1: повреждён")
+    await bot.compile(update, None)
+    await bot.wait_tasks()
+    assert session.files[0].exists()
+    assert not session.busy
+    update.effective_message.reply_document.assert_not_called()
+    assert "Файл №1" in update.effective_message.reply_text.call_args.args[0]
+
+
+async def test_restricted_access(harness):
+    from dataclasses import replace
+
+    bot, store, runner, update = harness
+    bot.settings = replace(bot.settings, allowed_user_ids=frozenset({999}))
+    await bot.newpdf(update, None)
+    await bot.receive(update, None)
+    assert not store.sessions
+    assert "ограничен" in update.effective_message.reply_text.call_args.args[0]
+
+
+async def test_photo_album_order(harness):
+    bot, store, runner, update = harness
+    for value in (b"first", b"second", b"third"):
+
+        async def download(custom_path, content=value):
+            custom_path.write_bytes(content)
+
+        remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
+        update.effective_message.photo = [
+            SimpleNamespace(file_size=len(value), get_file=AsyncMock(return_value=remote))
+        ]
+        await bot.receive(update, None)
+    assert [path.read_bytes() for path in store.get((1, 1)).files] == [
+        b"first",
+        b"second",
+        b"third",
+    ]
+
+
+async def test_failed_download_removes_partial_file(harness):
+    bot, store, runner, update = harness
+
+    async def download(custom_path):
+        custom_path.write_bytes(b"partial")
+        raise RuntimeError("download interrupted")
+
+    remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
+    update.effective_message.document = SimpleNamespace(
+        file_name="photo.png", file_size=10, get_file=AsyncMock(return_value=remote)
+    )
+    await bot.receive(update, None)
+    session = store.get((1, 1))
+    assert not session.files
+    assert not list(session.directory.iterdir())
+
+
+async def test_cancel_during_send_reports_it_is_too_late(harness):
+    bot, store, runner, update = harness
+    session = queued(store)
+    session.busy = session.sending = True
+    await bot.cancel(update, None)
+    assert not session.cancelled
+    assert "отправляется" in update.effective_message.reply_text.call_args.args[0]

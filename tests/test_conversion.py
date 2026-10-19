@@ -47,8 +47,9 @@ def test_text_encodings_and_pagination(tmp_path, font, encoding):
     assert "Привет" in reader.pages[0].extract_text()
 
 
-@pytest.mark.parametrize("name,content", [("bad.exe", b"MZ"), ("bad.jpg", b"broken"),
-                                         ("bad.pdf", b"broken")])
+@pytest.mark.parametrize(
+    "name,content", [("bad.exe", b"MZ"), ("bad.jpg", b"broken"), ("bad.pdf", b"broken")]
+)
 def test_bad_files_fail_without_partial_output(tmp_path, font, name, content):
     path = tmp_path / name
     path.write_bytes(content)

@@ -17,8 +17,10 @@ def test_settings(monkeypatch):
     assert "123:example" not in repr(settings)
 
 
-@pytest.mark.parametrize("name,value", [("MAX_FILES", "0"), ("MAX_FILE_BYTES", "20000001"),
-                                       ("ALLOWED_USER_IDS", "hello")])
+@pytest.mark.parametrize(
+    "name,value",
+    [("MAX_FILES", "0"), ("MAX_FILE_BYTES", "20000001"), ("ALLOWED_USER_IDS", "hello")],
+)
 def test_invalid_settings(monkeypatch, name, value):
     monkeypatch.setenv("BOT_TOKEN", "123:example")
     monkeypatch.setenv(name, value)
