@@ -112,3 +112,4 @@ ruff format --check .
 критерии приёмки. В GitHub Actions установлены LibreOffice и шрифты, тесты запускаются
 на Python 3.12 и 3.13. Локально офисная интеграция пропускается при отсутствии LibreOffice.
 `requirements.lock` фиксирует runtime-зависимости; dev-инструменты заданы в `pyproject.toml`.
+Подробные результаты ручных и автоматических проверок: [VERIFICATION.md](VERIFICATION.md).
